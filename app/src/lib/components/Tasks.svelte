@@ -58,7 +58,11 @@
   let online = $derived(conn.status === 'online');
   let all = $derived(ops.tasks.map(normalizeTask));
   let sessionFilter = $derived(route.name === 'tasks' ? (route.id ?? null) : null);
-  let sessionTitle = (id: string) => app.sessions.find((s) => s.id === id)?.title || (id ? 'Session ' + id.slice(-6) : 'No session');
+  let sessionTitle = (id: string) => {
+    const session = app.sessions.find((s) => s.id === id);
+    if (session) return session.title || 'New session';
+    return id ? 'Session ' + id.slice(-6) : 'No session';
+  };
   let harnessName = (id: string | undefined) => app.harnesses.find((h) => h.id === id)?.name ?? id ?? '';
 
   type Filter = 'active' | 'attention' | 'finished' | 'all';
@@ -285,7 +289,7 @@
       {#if t.profile}<div class="kv"><span>Profile</span><b>{ops.profiles.find((p) => p.id === t.profile)?.name ?? 'Deleted profile'}</b></div>{/if}
       {#if t.team}<div class="kv"><span>Team</span><b>{ops.teams.find((x) => x.id === t.team)?.name ?? 'Deleted team'}</b></div>{/if}
       <div class="kv"><span>Start</span><b>{scheduleText(t.schedule, now)}</b></div>
-      <div class="kv"><span>Attempts</span><b>{t.attempts} of {t.maxAttempts}{t.maxAttempts > 1 ? ' · retry after ' + Math.round(t.retryDelayMs / 1000) + 's' : ''}</b></div>
+      {#if t.maxAttempts > 1}<div class="kv"><span>Retries</span><b>Up to {t.maxAttempts} attempts per step, {Math.round(t.retryDelayMs / 1000)}s apart</b></div>{/if}
       <div class="kv"><span>Created</span><b>{clockText(t.createdAt, now)}</b></div>
     </div>
 

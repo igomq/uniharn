@@ -79,6 +79,8 @@ const LOG_LABEL: Record<string, string> = {
   failed: 'Failed',
   canceled: 'Canceled',
   interrupted: 'Interrupted',
+  target_busy: 'Session busy, waiting',
+  dependencies_ready: 'Dependencies done',
   dependency_wait: 'Waiting for dependencies',
   dependency_failed: 'Dependency failed'
 };
