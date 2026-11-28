@@ -3,6 +3,8 @@ import type { Session, SessionSummary } from '../sessions.js';
 
 export type Json = any;
 
+export class SessionBusy extends Error {}
+
 export type BuiltinHarnessId = 'devin' | 'codex' | 'claude' | 'kiro' | 'opencode' | 'grok' | 'mistral-vibe' | 'command-code' | 'antigravity';
 export type HarnessId = BuiltinHarnessId | string;
 
@@ -98,6 +100,9 @@ export interface CreateSessionOptions {
   model?: string;
   mode?: string;
   mcpServers?: Json[];
+  subagentModel?: string | null;
+  prelude?: string;
+  envAllowlist?: string[];
 }
 
 export interface HarnessAdapter extends EventEmitter {
@@ -112,9 +117,11 @@ export interface HarnessAdapter extends EventEmitter {
   listSessions(cwd?: string): Promise<SessionSummary[]>;
   createSession(cwd: string, opts?: CreateSessionOptions): Promise<Session>;
   ensureLoaded(sessionId: string, cwd?: string): Promise<Session>;
+  sessionCwd(sessionId: string): string | undefined;
   /** Native ACP child sessions announced on this harness's connections (never top-level sessions). */
   listNativeSubagents?(): { parentSessionId: string; child: Session }[];
   prompt(sessionId: string, text: string, images?: { mimeType: string; data: string }[], files?: { name: string; mimeType: string; text: string }[]): Promise<void>;
+  promptAndWait(sessionId: string, text: string, signal: AbortSignal, prelude?: string): Promise<void>;
   /** Urgent mid-turn delivery through `_session/steering` when the harness advertises it. */
   steer?(sessionId: string, text: string): Promise<{ mode: 'steering' | 'prompt'; outcome?: Json }>;
   cancel(sessionId: string): Promise<void>;
@@ -128,5 +135,7 @@ export interface HarnessAdapter extends EventEmitter {
   authenticate?(methodId: string): Promise<Json>;
   /** Offer these MCP servers (e.g. uniharn's delegation server) to the harness's sessions. */
   setMcpServers?(servers: (cwd?: string, ref?: string) => Json[]): void;
+  /** Verify that the running process (or the next launch) has exactly this environment preset. */
+  assertSessionEnvAllowlist?(allowlist: string[]): void;
   stop(): void;
 }

@@ -168,7 +168,29 @@
   let ctx = $derived(st.context && st.context.size > 0 ? st.context : null);
   let ctxPct = $derived(ctx ? Math.min(100, Math.round((ctx.used / ctx.size) * 100)) : 0);
 
-  // Working-tree summary for the header, refreshed whenever a tool call finishes.
+  // Composer toolbar destinations. The router opens the Tasks screen when it sees this window event.
+  let changesHash = $derived('#/s/' + encodeURIComponent(id) + '/changes');
+  function openTasks() {
+    window.dispatchEvent(new CustomEvent('uniharn:operations', { detail: { open: 'tasks', sessionId: id } }));
+  }
+
+  // Spoken turn status for screen readers; the header shows the same thing visually.
+  let announcement = $state('');
+  let announcedStatus = '';
+  $effect(() => {
+    const status = st.status;
+    const name = harnessShort;
+    untrack(() => {
+      if (status === announcedStatus) return;
+      const wasBusy = announcedStatus === 'running' || announcedStatus === 'awaiting_permission';
+      announcedStatus = status;
+      if (status === 'running') announcement = `${name} is working`;
+      else if (status === 'awaiting_permission') announcement = `${name} needs approval`;
+      else if (wasBusy) announcement = status === 'error' ? `${name} stopped with an error` : `${name} finished`;
+    });
+  });
+
+  // Working-tree summary for the composer toolbar, refreshed whenever a tool call finishes.
   let changes = $state<{ files: number; added: number; removed: number } | null>(null);
   let toolsDone = $derived((view?.items ?? []).filter((i) => i.kind === 'tool' && (i.status === 'completed' || i.status === 'failed')).length);
   $effect(() => {
@@ -399,16 +421,9 @@
         {#if mode}<span class="sep">·</span> {mode.name}{/if}
       </small>
     </button>
-    <div class="glass-group glass">
-      <SubagentsPanel sessionId={id} compact />
-      <button class="iconbtn diffbtn" class:has={changes && changes.files} onclick={() => go('#/s/' + encodeURIComponent(id) + '/changes')} aria-label={changes?.files ? `Changes: ${changes.files} files, ${changes.added} added, ${changes.removed} removed lines` : 'Changes'}>
-        {#if changes && changes.files}
-          <span class="plus">+{changes.added}</span><span class="minus">−{changes.removed}</span>
-        {:else}<Icon name="diff" />{/if}
-      </button>
-      <button class="iconbtn" onclick={() => (controls = true)} aria-label="Session settings"><Icon name="settings" /></button>
-    </div>
+    <button class="iconbtn glass" onclick={() => (controls = true)} aria-label="Session settings"><Icon name="settings" /></button>
   </header>
+  <span class="sr-only" role="status">{announcement}</span>
 
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="log scroller" bind:this={scroller} onscroll={onScroll} onclick={copyCode} style:padding-bottom={dockHeight + 20 + 'px'}>
@@ -494,7 +509,7 @@
           {/if}
         {/each}
         {#if st.status === 'running' && blocks[blocks.length - 1]?.kind === 'user'}
-          <div class="typing" aria-label="{harnessShort} is working"><span></span><span></span><span></span></div>
+          <div class="typing" aria-hidden="true"><span></span><span></span><span></span></div>
         {/if}
       {/if}
     </div>
@@ -520,19 +535,35 @@
           {/each}
         </div>
       {/if}
-      {#if ctx}
+      <div class="tools" role="group" aria-label="Session tools">
+        <SubagentsPanel sessionId={id} compact />
+        <button class="toolchip" onclick={openTasks} aria-label="Tasks" title="Tasks"><Icon name="checkSquare" size={16} /><span class="tlabel">Tasks</span></button>
+        <button class="toolchip" onclick={() => go(changesHash + '?tab=runs')} aria-label="Runs" title="Runs"><Icon name="terminal" size={16} /><span class="tlabel">Runs</span></button>
         <button
-          class="ctxm glass"
-          class:warn={ctxPct >= 80 && ctxPct < 95}
-          class:full={ctxPct >= 95}
-          onclick={() => (controls = true)}
-          aria-label="Context window: {compact(ctx.used)} of {compact(ctx.size)} tokens used, {ctxPct}%. Open session settings"
-          title="Context window"
+          class="toolchip"
+          onclick={() => go(changesHash)}
+          aria-label={changes?.files ? `Changes: ${changes.files} files, ${changes.added} added, ${changes.removed} removed lines` : 'Changes'}
+          title="Changes"
         >
-          <span class="ctxbar" aria-hidden="true"><i style:width={ctxPct + '%'}></i></span>
-          <span class="ctxt">{compact(ctx.used)}/{compact(ctx.size)} · {ctxPct}%</span>
+          <Icon name="diff" size={16} />
+          <span class="tlabel">Changes</span>
+          {#if changes && changes.files}<span class="delta" aria-hidden="true"><span class="plus">+{changes.added}</span><span class="minus">−{changes.removed}</span></span>{/if}
         </button>
-      {/if}
+        <span class="grow"></span>
+        {#if ctx}
+          <button
+            class="toolchip ctxm"
+            class:warn={ctxPct >= 80 && ctxPct < 95}
+            class:full={ctxPct >= 95}
+            onclick={() => (controls = true)}
+            aria-label="Context window: {compact(ctx.used)} of {compact(ctx.size)} tokens used, {ctxPct}%. Open session settings"
+            title="Context window"
+          >
+            <span class="ctxbar" aria-hidden="true"><i style:width={ctxPct + '%'}></i></span>
+            <span class="ctxt" aria-hidden="true"><span class="ctx-tokens">{compact(ctx.used)}/{compact(ctx.size)} · </span>{ctxPct}%</span>
+          </button>
+        {/if}
+      </div>
       <div class="composer" bind:this={composerEl}>
         <div class="box glass" class:dropping>
           {#if images.length || docs.length}
@@ -652,14 +683,18 @@
   .sep {
     color: var(--text-3);
   }
-  .diffbtn.has {
-    width: auto;
-    min-width: 40px;
-    padding: 0 10px;
+  /* Permanent row above the composer: subagents, tasks, runs, changes and the context meter. */
+  .tools {
+    display: flex;
+    align-items: center;
     gap: 6px;
+    min-width: 0;
+    margin-bottom: -2px;
+  }
+  .delta {
     display: inline-flex;
-    border-radius: 999px;
-    font: 600 12.5px var(--mono);
+    gap: 5px;
+    font: 600 12px var(--mono);
     font-variant-numeric: tabular-nums;
   }
   .plus {
@@ -892,7 +927,7 @@
     right: 0;
     bottom: 0;
     z-index: 15;
-    padding: 18px calc(var(--safe-right) + 10px) calc(var(--safe-bottom) + 10px) calc(var(--safe-left) + 10px);
+    padding: 14px calc(var(--safe-right) + 10px) calc(var(--safe-bottom) + 10px) calc(var(--safe-left) + 10px);
     pointer-events: none;
   }
   .dock::before {
@@ -908,7 +943,7 @@
     margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
   }
   .dock-inner > * {
     pointer-events: auto;
@@ -1033,23 +1068,13 @@
   .grow {
     flex: 1;
   }
-  /* Context window meter: a slim glass pill above the composer. */
+  /* Context window meter at the end of the toolbar. */
   .ctxm {
-    align-self: flex-end;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    height: 26px;
-    margin-bottom: -2px;
-    padding: 0 10px;
-    border-radius: 999px;
     font: 500 11.5px var(--mono);
     font-variant-numeric: tabular-nums;
-    color: var(--text-2);
-    box-shadow: inset 0 0 0 1px var(--glass-rim);
   }
   .ctxbar {
-    width: 44px;
+    width: 36px;
     height: 3px;
     border-radius: 99px;
     background: var(--fill-2);
@@ -1073,6 +1098,11 @@
   }
   .ctxm.full .ctxbar i {
     background: var(--red);
+  }
+  @media (max-width: 430px) {
+    .ctx-tokens {
+      display: none;
+    }
   }
   /* Reasoning and speed: a gauge button in the bar opens this popover above the composer. */
   .composer {

@@ -353,3 +353,34 @@ test('strict roots gate all cwd entry points and discovery mode still allows bro
   await ok(other, 'hello', { token: master });
   assert.equal((await ok(other, 'fs.listDirs', { path: discovery.outside })).path, discovery.outside);
 });
+
+test('usage RPC replies and operations broadcasts carry the same report', { timeout: 15_000 }, async (t) => {
+  const { open, config } = await startGateway(t);
+  writeFileSync(config.devinBin, `#!/usr/bin/env node
+if (process.argv[2] === '--version') console.log('devin mock');
+else if (process.argv[2] === 'auth') console.log('Not logged in');
+else if (process.argv[2] === 'acp') require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const { id, method } = JSON.parse(line);
+  if (method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id, result: { protocolVersion: 1 } }));
+});
+`, { mode: 0o755 });
+  const ws = await open();
+  const observer = await open();
+  t.after(() => { ws.terminate(); observer.terminate(); });
+  await ok(ws, 'hello', { token: master });
+  await ok(observer, 'hello', { token: master });
+  const listed = await ok(ws, 'usage.list');
+  assert.deepEqual(Object.keys(listed), ['usage']);
+  assert.ok(listed.usage.harnesses.some((h: any) => h.harnessId === 'devin'));
+  assert.ok(listed.usage.officialError);
+  const pushed = nextMessage(observer, (m) => m.type === 'operations');
+  const updated = await ok(ws, 'usage.update', { harnessId: 'devin', manual: { note: 'from RPC', usagePercent: 12 } });
+  assert.deepEqual(Object.keys(updated), ['usage']);
+  assert.deepEqual((await pushed).usage, updated.usage);
+  assert.equal(updated.usage.harnesses.find((h: any) => h.harnessId === 'devin').manual.note, 'from RPC');
+  const bad = await rpc(ws, 'usage.update', { harnessId: 'devin', manual: { usagePercent: 101 } });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /usagePercent/);
+  assert.equal((await ok(ws, 'usage.update', { harnessId: 'devin', reset: true })).usage.harnesses.find((h: any) => h.harnessId === 'devin').manual, null);
+  assert.equal((await rpc(ws, 'usage.list', { refresh: 'yes' })).ok, false);
+});

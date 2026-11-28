@@ -400,13 +400,13 @@ export class NotificationService extends EventEmitter {
   // ---- watchers ------------------------------------------------------------
 
   /** Feed every session summary here; it notices running -> idle/error transitions. */
-  onSessionState(s: { sessionId: string; harnessId?: string; title?: string | null; status: string; lastError?: string | null; cwd?: string | null }) {
+  onSessionState(s: { sessionId: string; harnessId?: string; title?: string | null; status: string; lastError?: string | null; cwd?: string | null }, notifyTurn = true) {
     const prev = this.sessionStatus.get(s.sessionId);
     this.sessionStatus.set(s.sessionId, s.status);
     const label = s.title || basename(s.cwd) || 'Session';
     if (s.status === 'running') this.armStall(s.sessionId, s.harnessId ?? null, label);
     else this.disarm(`stall:${s.sessionId}`);
-    if (prev !== 'running' && prev !== 'awaiting_permission') return;
+    if (!notifyTurn || (prev !== 'running' && prev !== 'awaiting_permission')) return;
     if (s.status === 'idle') {
       this.notify({ type: 'task_completed', title: `${label} finished`, body: harnessLabel(s.harnessId) + ' finished its turn.', sessionId: s.sessionId, harnessId: s.harnessId ?? null, dedupKey: `task_completed:${s.sessionId}:${this.now()}` });
     } else if (s.status === 'error') {

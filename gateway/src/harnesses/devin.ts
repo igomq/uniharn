@@ -147,12 +147,20 @@ export class DevinHarnessAdapter extends EventEmitter implements HarnessAdapter 
     }
   }
 
+  sessionCwd(sessionId: string): string | undefined {
+    return this.manager.sessionCwd(sessionId);
+  }
+
   listNativeSubagents() {
     return this.manager.nativeSubagentSessions();
   }
 
   prompt(sessionId: string, text: string, images: { mimeType: string; data: string }[] = [], files: PromptFile[] = []): Promise<void> {
     return this.manager.prompt(sessionId, text, images, files);
+  }
+
+  promptAndWait(sessionId: string, text: string, signal: AbortSignal, prelude?: string): Promise<void> {
+    return this.manager.promptAndWait(sessionId, text, signal, prelude);
   }
 
   steer(sessionId: string, text: string) {

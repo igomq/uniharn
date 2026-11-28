@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path';
 import type { Session, SessionSummary } from '../sessions.js';
 import type { CreateSessionOptions, CustomAcpHarnessSpec, HarnessAdapter, HarnessConfig, HarnessId, HarnessInfo, Json } from './types.js';
+import { findModeChoice, modelOptionOf, optionValueIds } from '../subagents.js';
+import type { SessionManager } from '../sessions.js';
 
 interface PersistedRegistry {
   configs: Record<string, HarnessConfig>;
@@ -32,6 +34,20 @@ export function formatScopedSessionId(harnessId: HarnessId, nativeId: string): s
   return nativeId.startsWith(`${harnessId}:`) ? nativeId : `${harnessId}:${nativeId}`;
 }
 
+/** Resolve and check the known directory before session/load can start the harness in it. */
+export async function loadSessionInPath(registry: HarnessRegistry, sessionId: string, checkPath: (cwd: string) => string, expectedCwd?: string) {
+  const { adapter, harnessId, nativeId } = registry.resolveSession(sessionId);
+  if (!nativeId) throw new Error('Invalid session target');
+  const expected = expectedCwd === undefined ? undefined : checkPath(expectedCwd);
+  const known = adapter.sessionCwd(nativeId) ?? expected ?? (await adapter.listSessions()).find(s => s.sessionId === nativeId)?.cwd;
+  if (!known) throw new Error('Cannot determine the session folder');
+  const cwd = checkPath(known);
+  if (expected !== undefined && cwd !== expected) throw new Error('Session folder does not match the target');
+  const session = await adapter.ensureLoaded(nativeId, cwd);
+  if (checkPath(session.cwd) !== cwd) throw new Error('Session folder does not match the target');
+  return { adapter, harnessId, nativeId, session, cwd };
+}
+
 /**
  * Central registry for all coding-agent harnesses and their persisted configurations.
  * Routes session operations to the owning adapter without session ID collisions.
@@ -43,11 +59,15 @@ export class HarnessRegistry extends EventEmitter {
   private customSpecs = new Map<string, CustomAcpHarnessSpec>();
   private configFile: string;
   private customFactory: ((spec: CustomAcpHarnessSpec) => HarnessAdapter) | null = null;
+  private sessionOptionsFile: string;
+  private sessionOptions: Record<string, { options: CreateSessionOptions; preludePending: boolean }> = {};
 
   constructor(private dataDir: string) {
     super();
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.configFile = join(dataDir, 'harnesses.json');
+    this.sessionOptionsFile = join(dataDir, 'session-options.json');
+    if (existsSync(this.sessionOptionsFile)) this.sessionOptions = JSON.parse(readFileSync(this.sessionOptionsFile, 'utf8'));
     this.loadPersisted();
   }
 
@@ -85,20 +105,40 @@ export class HarnessRegistry extends EventEmitter {
   }
 
   register(adapter: HarnessAdapter) {
+    const manager = (adapter as HarnessAdapter & { manager?: SessionManager }).manager;
+    if (manager) {
+      manager.sessionOptions = (id) => this.sessionOptions[formatScopedSessionId(adapter.id, id)];
+      manager.saveSessionOptions = (id, options, preludePending) => this.saveSessionOptions(formatScopedSessionId(adapter.id, id), options, preludePending);
+    }
     if (this.mcpServers) adapter.setMcpServers?.(this.mcpServers);
     this.adapters.set(adapter.id, adapter);
     if (!adapter.custom) this.fallbackAdapters.set(adapter.id, adapter);
     const saved = this.configs.get(adapter.id);
     if (saved) adapter.configure(saved);
     adapter.on('event', (s: Session, ev: Json) => this.emit('event', s, ev));
-    adapter.on('state', (summary: SessionSummary) => this.emit('state', summary));
+    adapter.on('state', (summary: SessionSummary, scheduled?: boolean) => this.emit('state', summary, scheduled));
     adapter.on('permission', (s: Session, p: Json) => this.emit('permission', s, p));
     adapter.on('permission_resolved', (s: Session, reqId: string, optionId: string | null) =>
       this.emit('permission_resolved', s, reqId, optionId),
     );
     adapter.on('reset', (s: Session) => this.emit('reset', s));
-    adapter.on('deleted', (sessionId: string) => this.emit('deleted', formatScopedSessionId(adapter.id, sessionId)));
+    adapter.on('deleted', (sessionId: string) => {
+      const id = formatScopedSessionId(adapter.id, sessionId);
+      if (this.sessionOptions[id]) { delete this.sessionOptions[id]; this.persistSessionOptions(); }
+      this.emit('deleted', id);
+    });
     adapter.on('status', (info: HarnessInfo) => this.emit('harness_status', info));
+  }
+
+  private persistSessionOptions() {
+    const tmp = `${this.sessionOptionsFile}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.sessionOptions, null, 2) + '\n', { mode: 0o600 });
+    renameSync(tmp, this.sessionOptionsFile);
+  }
+
+  private saveSessionOptions(id: string, options: CreateSessionOptions, preludePending: boolean) {
+    this.sessionOptions[id] = { options, preludePending };
+    this.persistSessionOptions();
   }
 
   /** Instantiates adapters for persisted and newly registered custom ACP definitions. */
@@ -247,6 +287,37 @@ export class HarnessRegistry extends EventEmitter {
   async createSession(harnessId: HarnessId, cwd: string, opts?: CreateSessionOptions): Promise<Session> {
     const adapter = this.require(harnessId);
     if (!adapter.info().enabled) throw new Error(`Harness ${harnessId} is disabled`);
-    return adapter.createSession(cwd, opts);
+    if (opts?.envAllowlist?.length) this.assertSessionEnvAllowlist(harnessId, opts.envAllowlist);
+    const session = await adapter.createSession(cwd, opts);
+    try {
+      if (opts?.model) {
+        const option = modelOptionOf(session.configOptions);
+        if (!option) throw new Error(`${harnessId} does not offer a model choice`);
+        const values = optionValueIds(option);
+        if (values.length && !values.includes(opts.model)) throw new Error(`${harnessId} does not offer model ${opts.model}`);
+        await adapter.setConfigOption(session.sessionId, option.id, opts.model);
+      }
+      if (opts?.mode) {
+        const mode = findModeChoice(session.configOptions, session.modes, opts.mode);
+        if (!mode) throw new Error(`${harnessId} does not offer mode ${opts.mode}`);
+        if (mode.source === 'config') await adapter.setConfigOption(session.sessionId, mode.configId, String(mode.value ?? mode.id));
+        else await adapter.setMode(session.sessionId, String(mode.id ?? mode.value));
+      }
+      if (opts?.prelude || opts?.subagentModel !== undefined || opts?.envAllowlist?.length) {
+        session.options = { prelude: opts.prelude, subagentModel: opts.subagentModel, envAllowlist: opts.envAllowlist };
+        session.preludePending = !!opts.prelude;
+        this.saveSessionOptions(formatScopedSessionId(harnessId, session.sessionId), session.options, session.preludePending);
+      }
+      return session;
+    } catch (e) {
+      await adapter.deleteSession(session.sessionId).catch(() => adapter.closeSession(session.sessionId).catch(() => undefined));
+      throw e;
+    }
+  }
+
+  assertSessionEnvAllowlist(harnessId: string, allowlist: string[]) {
+    const adapter = this.require(harnessId);
+    if (!adapter.assertSessionEnvAllowlist) throw new Error(`Harness ${harnessId} cannot isolate this environment preset`);
+    adapter.assertSessionEnvAllowlist(allowlist);
   }
 }

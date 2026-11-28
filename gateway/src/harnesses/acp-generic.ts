@@ -7,6 +7,7 @@ import { fallbackBinDirs, mergePath } from '../shell-path.js';
 import { SessionManager, type PromptFile, type Session, type SessionSummary } from '../sessions.js';
 import { authState, type CommandResult, type CommandRunner, isAuthError, notInstalled, runCommand } from './auth.js';
 import type { AuthState, CreateSessionOptions, HarnessAdapter, HarnessCapabilities, HarnessConfig, HarnessInfo, Json } from './types.js';
+import { safeEnvAllowlist } from '../presets.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +78,7 @@ export class AcpHarnessAdapter extends EventEmitter implements HarnessAdapter {
   private bin: string;
   private args: string[] = [];
   private envAllowlist: string[];
+  private launchedEnvAllowlist: string[] | null = null;
   private enabled: boolean;
   private installed = false;
   private resolvedBin: string | null = null;
@@ -98,8 +100,14 @@ export class AcpHarnessAdapter extends EventEmitter implements HarnessAdapter {
       baseArgs: spec.acpArgs,
       label: `${spec.id} acp`,
       cwd: spec.cwd,
-      env: () => filterEnv(this.envAllowlist),
+      env: () => {
+        this.launchedEnvAllowlist = [...this.envAllowlist];
+        return filterEnv(this.envAllowlist);
+      },
     });
+    this.manager.validateSessionOptions = (options) => {
+      if (options.envAllowlist?.length) this.assertSessionEnvAllowlist(options.envAllowlist);
+    };
     for (const ev of ['event', 'state', 'permission', 'permission_resolved', 'reset', 'deleted'] as const) {
       this.manager.on(ev, (...a: Json[]) => this.emit(ev, ...a));
     }
@@ -112,6 +120,22 @@ export class AcpHarnessAdapter extends EventEmitter implements HarnessAdapter {
     if (patch.args) this.args = [...patch.args];
     if (patch.envAllowlist) this.envAllowlist = [...patch.envAllowlist];
     this.resolveLaunchBin();
+  }
+
+  assertSessionEnvAllowlist(allowlist: string[]): void {
+    if (!this.custom) throw new Error('Environment presets require a custom ACP harness with a matching environment allowlist');
+    const desired = safeEnvAllowlist(allowlist);
+    const configured = safeEnvAllowlist(this.envAllowlist);
+    if (!configured.length) throw new Error('The custom harness inherits its full environment; configure an explicit allowlist');
+    const same = (actual: string[]) => {
+      const a = new Set([...BASE_ENV_KEYS, ...safeEnvAllowlist(actual)]);
+      const b = new Set([...BASE_ENV_KEYS, ...desired]);
+      return a.size === b.size && [...a].every((key) => b.has(key));
+    };
+    if (!same(configured)) throw new Error('Profile environment allowlist does not match the custom harness configuration');
+    if (this.manager.agentStartingOrRunning && this.launchedEnvAllowlist && !same(this.launchedEnvAllowlist)) {
+      throw new Error('The running custom harness has a different environment; stop it before using this preset');
+    }
   }
 
   /** Resolves `bin` (or, while it is not overridden, the spec's `altBins`) and launches with the result. */
@@ -248,11 +272,19 @@ export class AcpHarnessAdapter extends EventEmitter implements HarnessAdapter {
       throw e;
     }
   }
+  sessionCwd(sessionId: string): string | undefined {
+    return this.manager.sessionCwd(sessionId);
+  }
+
   listNativeSubagents() {
     return this.manager.nativeSubagentSessions();
   }
   prompt(sessionId: string, text: string, images: { mimeType: string; data: string }[] = [], files: PromptFile[] = []): Promise<void> {
     return this.manager.prompt(sessionId, text, images, files);
+  }
+
+  promptAndWait(sessionId: string, text: string, signal: AbortSignal, prelude?: string): Promise<void> {
+    return this.manager.promptAndWait(sessionId, text, signal, prelude);
   }
   steer(sessionId: string, text: string) {
     return this.manager.steer(sessionId, text);

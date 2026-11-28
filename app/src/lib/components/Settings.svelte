@@ -128,6 +128,26 @@
 
       <Devices />
 
+      <div class="label">Projects and automation</div>
+      <div class="card links">
+        <button class="linkrow press" onclick={() => go('#/tasks')}>
+          <span><b>Tasks</b><small>Scheduled prompts, dependencies and confirmations</small></span>
+          <Icon name="chevron" size={16} />
+        </button>
+        <button class="linkrow press" onclick={() => go('#/profiles')}>
+          <span><b>Profiles</b><small>Folder, harness, models and instructions for new sessions</small></span>
+          <Icon name="chevron" size={16} />
+        </button>
+        <button class="linkrow press" onclick={() => go('#/teams')}>
+          <span><b>Teams</b><small>Roles that work on one task together</small></span>
+          <Icon name="chevron" size={16} />
+        </button>
+        <button class="linkrow press" onclick={() => go('#/usage')}>
+          <span><b>Usage</b><small>Quota, resets, tokens and delegations per harness</small></span>
+          <Icon name="chevron" size={16} />
+        </button>
+      </div>
+
       <div class="label">Harness accounts</div>
       <button class="card linkrow press" onclick={() => go('#/accounts')}>
         <span>Logins, plans and Devin usage limits</span>
@@ -253,6 +273,21 @@
   }
   .linkrow :global(svg) {
     color: var(--text-2);
+  }
+  .links .linkrow {
+    padding: 8px 0;
+  }
+  .links .linkrow + .linkrow {
+    border-top: 1px solid var(--line);
+  }
+  .links .linkrow > span {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .links small {
+    font-size: 12.5px;
+    color: var(--text-3);
   }
   .disconnect {
     margin-top: 28px;

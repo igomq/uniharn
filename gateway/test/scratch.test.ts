@@ -101,3 +101,30 @@ for (const strictRoots of [false, true]) {
     }
   });
 }
+
+test('profile and team RPCs validate paths and start project sessions', { timeout: 15000 }, async (t) => {
+  const { ws, root, dataDir } = await startGateway(t, true);
+  await ok(ws, 'hello', { token: master });
+  const { profile } = await ok(ws, 'profiles.create', { profile: { name: 'Project', cwd: root, harnessId: 'devin', prelude: 'project instruction', commonCommands: ['npm test'] } });
+  assert.equal((await ok(ws, 'profiles.list')).profiles[0].id, profile.id);
+  const denied = await rpc(ws, 'profiles.update', { profileId: profile.id, patch: { cwd: dataDir } });
+  assert.equal(denied.ok, false);
+  assert.match(denied.error, /outside allowed roots/);
+  const created = await ok(ws, 'session.create', { profileId: profile.id });
+  assert.equal(created.session.cwd, root);
+  const { team } = await ok(ws, 'teams.create', { team: { name: 'Team', cwd: root, profileId: profile.id, roles: [{ name: 'Worker', harnessId: 'devin', instruction: 'Inspect' }] } });
+  assert.equal((await ok(ws, 'teams.list')).teams[0].id, team.id);
+  const outside = await rpc(ws, 'teams.start', { teamId: team.id, task: 'inspect', cwd: dataDir });
+  assert.equal(outside.ok, false);
+  assert.match(outside.error, /outside allowed roots/);
+  const started = await ok(ws, 'teams.start', { teamId: team.id, task: 'inspect' });
+  assert.equal(started.links.length, 1);
+  let status = started.links[0].status;
+  for (let i = 0; status === 'running' && i < 100; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    status = (await ok(ws, 'orchestration.get', { taskId: started.links[0].id })).link.status;
+  }
+  assert.equal(status, 'done');
+  assert.equal((await ok(ws, 'teams.delete', { teamId: team.id })).deleted, true);
+  assert.equal((await ok(ws, 'profiles.delete', { profileId: profile.id })).deleted, true);
+});

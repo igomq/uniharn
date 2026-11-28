@@ -1,6 +1,7 @@
 import { conn, isTauri, onNotificationMessage, rpc, type NotificationMessage } from './api.svelte.ts';
 import { getStorageItem, setStorageItem } from './storage.ts';
 import { go } from './ui.svelte.ts';
+import { notificationRoute } from './operations.ts';
 import type { AppNotification, NotificationCapabilities, NotificationEventType, NotificationPrefs } from './types.ts';
 
 export const EVENT_LABELS: Record<NotificationEventType, string> = {
@@ -205,7 +206,9 @@ export function initNotifications() {
   navigator.serviceWorker?.addEventListener('message', (e) => {
     if (e.data?.type === 'uniharn:navigate') {
       if (e.data.id) markRead([e.data.id]);
-      if (e.data.route) go(e.data.route);
+      const known = notif.items.find((n) => n.id === e.data.id);
+      const target = known ? notificationRoute(known) : e.data.route;
+      if (target) go(target);
     }
   });
   refreshPushState();
@@ -215,7 +218,8 @@ export function openNotification(n: AppNotification) {
   markRead([n.id]);
   if (notif.banner?.id === n.id) notif.banner = null;
   notif.centerOpen = false;
-  if (n.route) go(n.route);
+  const target = notificationRoute(n);
+  if (target) go(target);
 }
 
 export async function markRead(ids?: string[]) {

@@ -3,6 +3,8 @@
 import { getStorageItem, removeStorageItem, setStorageItem } from './storage.ts';
 import { defaultDeviceName, detectPlatform, httpBase, pageOrigin, pairDevice } from './pairing.ts';
 import { applyUpdate, emptyState, permissionView, stateFromSummary } from './timeline.ts';
+import { emptyOperations, removeById, upsertById, type Profile, type ScheduledTask, type Team } from './operations.ts';
+import type { UsageReport } from './usage.ts';
 import type { AppNotification, ChangedFileView, ConnInfo, DeviceInfo, GitStatus, GitStatusView, HarnessInfo, Json, PendingPermission, SessionLink, SessionRow, SessionSummary, SessionView, SubagentDefault, SubagentEntry, TaskRun, Workspace } from './types.ts';
 
 const STORE_SUFFIX = 'connection';
@@ -95,6 +97,17 @@ export const app = $state({
 
 export const views = $state<Record<string, SessionView>>({});
 
+/** Profiles, teams, scheduled tasks and usage from the gateway; scheduled tasks follow `scheduler_state` pushes. */
+export const ops = $state(emptyOperations());
+
+/**
+ * Tells screens outside this module what changed: `uniharn:operations` with the changed collections as detail,
+ * plus `task` and `event` for a scheduler push.
+ */
+function publishOperations(detail: Json) {
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('uniharn:operations', { detail }));
+}
+
 type TermMessage = { ev: 'term'; data: string } | { ev: 'term-exit'; code: number | null };
 
 let ws: WebSocket | null = null;
@@ -117,6 +130,7 @@ function clearSessions() {
   app.sessionsLoaded = false;
   app.subagents = [];
   app.subagentSettings = [];
+  Object.assign(ops, emptyOperations());
 }
 
 export function saveConnection(url: string, token: string, identity: SavedMeta = {}) {
@@ -247,6 +261,7 @@ export function connect(force = false) {
       pingTimer = setInterval(() => conn.status === 'online' && probe(10000), 25000);
       persist();
       refreshSessions();
+      refreshOperations();
       for (const id of Object.keys(views)) openSession(id).catch(() => {});
     } catch (err) {
       if (ws !== sock) return;
@@ -416,7 +431,11 @@ function gitStatusView(r: GitStatus): GitStatusView {
 // request types and reshapes the answer.
 const calls: Record<string, (p: Json) => Promise<Json>> = {
   'sessions.create': async (p) => {
-    const r = await request('session.create', { ...(p.noProject ? { noProject: true } : { cwd: p.cwd }), ...(p.harnessId && p.harnessId !== 'devin' ? { harnessId: p.harnessId } : {}) });
+    const r = await request('session.create', {
+      ...(p.noProject ? { noProject: true } : { cwd: p.cwd }),
+      ...(p.harnessId && p.harnessId !== 'devin' ? { harnessId: p.harnessId } : {}),
+      ...(p.profileId ? { profileId: p.profileId } : {})
+    });
     upsert(r.session);
     return { id: r.session.sessionId, cwd: r.session.cwd };
   },
@@ -542,6 +561,70 @@ const calls: Record<string, (p: Json) => Promise<Json>> = {
     return r.links;
   },
   'projects.list': () => request('projects.list'),
+  'profiles.list': async () => {
+    const r = await request('profiles.list');
+    ops.profiles = r.profiles;
+    publishOperations({ profiles: ops.profiles });
+    return r.profiles;
+  },
+  'profiles.create': async (p) => saveProfile((await request('profiles.create', { profile: p.profile })).profile),
+  'profiles.update': async (p) => saveProfile((await request('profiles.update', { profileId: p.profileId, patch: p.patch })).profile),
+  'profiles.delete': async (p) => {
+    const r = await request('profiles.delete', { profileId: p.profileId });
+    ops.profiles = removeById(ops.profiles, p.profileId);
+    publishOperations({ profiles: ops.profiles });
+    return r;
+  },
+  'teams.list': async () => {
+    const r = await request('teams.list');
+    ops.teams = r.teams;
+    publishOperations({ teams: ops.teams });
+    return r.teams;
+  },
+  'teams.create': async (p) => saveTeam((await request('teams.create', { team: p.team })).team),
+  'teams.update': async (p) => saveTeam((await request('teams.update', { teamId: p.teamId, patch: p.patch })).team),
+  'teams.delete': async (p) => {
+    const r = await request('teams.delete', { teamId: p.teamId });
+    ops.teams = removeById(ops.teams, p.teamId);
+    publishOperations({ teams: ops.teams });
+    return r;
+  },
+  // Each role becomes a delegated session; without a parent session they are listed like any other session.
+  'teams.start': async (p) => {
+    const r = await request('teams.start', {
+      teamId: p.teamId,
+      task: p.task,
+      ...(p.cwd ? { cwd: p.cwd } : {}),
+      ...(p.profileId ? { profileId: p.profileId } : {}),
+      ...(p.sessionId ? { sessionId: p.sessionId } : {})
+    });
+    const links = r.links as SessionLink[];
+    for (const l of links) upsertLink(l);
+    await refreshSessions();
+    return links;
+  },
+  // Scheduler params pass through unchanged: `{ task }` to create, `{ taskId, patch }` to update, `{ taskId }` otherwise.
+  'scheduler.list': async (p) => {
+    const r = await request('scheduler.list', p);
+    ops.tasks = r.tasks;
+    publishOperations({ tasks: ops.tasks });
+    return r.tasks;
+  },
+  'scheduler.create': async (p) => saveTask((await request('scheduler.create', p)).task),
+  'scheduler.update': async (p) => saveTask((await request('scheduler.update', p)).task),
+  'scheduler.cancel': async (p) => saveTask((await request('scheduler.cancel', p)).task),
+  'scheduler.release': async (p) => saveTask((await request('scheduler.release', p)).task),
+  'scheduler.confirm': async (p) => saveTask((await request('scheduler.confirm', p)).task),
+  'scheduler.delete': async (p) => {
+    const r = await request('scheduler.delete', p);
+    ops.tasks = removeById(ops.tasks, r.task?.id ?? p.taskId ?? p.id);
+    publishOperations({ tasks: ops.tasks });
+    return r.task;
+  },
+  // Both answer `{ usage: UsageReport }`; an update is also broadcast to every client as an `operations` message.
+  'usage.list': async (p) => saveUsage((await request('usage.list', p.refresh ? { refresh: true } : {})).usage),
+  'usage.update': async (p) =>
+    saveUsage((await request('usage.update', { harnessId: p.harnessId, ...(p.manual !== undefined ? { manual: p.manual } : {}), ...(p.reset ? { reset: true } : {}) })).usage),
   'notifications.list': (p) => request('notifications.list', p),
   'notifications.read': (p) => request('notifications.read', p),
   'notifications.clear': () => request('notifications.clear'),
@@ -592,6 +675,39 @@ function shareableUrl(url: string): string | undefined {
 export function rpc(m: string, p: Json = {}): Promise<Json> {
   const fn = calls[m];
   return fn ? fn(p) : Promise.reject(new Error(`Unknown call: ${m}`));
+}
+
+function saveProfile(profile: Profile) {
+  ops.profiles = upsertById(ops.profiles, profile);
+  publishOperations({ profiles: ops.profiles });
+  return profile;
+}
+
+function saveTeam(team: Team) {
+  ops.teams = upsertById(ops.teams, team);
+  publishOperations({ teams: ops.teams });
+  return team;
+}
+
+function saveTask(task: ScheduledTask) {
+  ops.tasks = upsertById(ops.tasks, task);
+  publishOperations({ tasks: ops.tasks });
+  return task;
+}
+
+function saveUsage(usage: UsageReport) {
+  ops.usage = usage;
+  publishOperations({ usage });
+  return usage;
+}
+
+/**
+ * Loads profiles, teams and scheduled tasks after each connect. Gateways without them reject the calls,
+ * which leaves `ops.loaded` false.
+ */
+export async function refreshOperations() {
+  const [profiles] = await Promise.allSettled([rpc('profiles.list'), rpc('teams.list'), rpc('scheduler.list')]);
+  ops.loaded = profiles.status === 'fulfilled';
 }
 
 /** Pre-notification-system gateways only: a background system notification. Newer gateways send `notification` events. */
@@ -701,6 +817,12 @@ function onMessage(msg: Json) {
     }
     case 'orchestration_link':
       return upsertLink(msg.link);
+    case 'scheduler_state':
+      ops.tasks = msg.event === 'deleted' ? removeById(ops.tasks, msg.task.id) : upsertById(ops.tasks, msg.task);
+      return publishOperations({ tasks: ops.tasks, task: msg.task, event: msg.event });
+    case 'operations':
+      if (msg.usage) saveUsage(msg.usage);
+      return;
     case 'task_output':
     case 'task_done':
       for (const fn of taskListeners) fn(msg);

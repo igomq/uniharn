@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { app, conn, rpc, refreshSessions, openSession, errorText } from '#lib/api.svelte.ts';
+  import { app, conn, ops, rpc, refreshSessions, openSession, errorText } from '#lib/api.svelte.ts';
+  import { newSessionParams, parseSessionChoice, sessionChoiceKey, type SessionChoice } from '#lib/operations.ts';
+  import { normalizeTask } from '#lib/scheduler.ts';
   import type { SessionRow } from '#lib/types.ts';
   import { go, toast, route, requests, fresh } from '#lib/ui.svelte.ts';
   import { ago, shortPath } from '#lib/format.ts';
   import { isScratchPath, projectLabel, shortHarnessName } from '#lib/labels.ts';
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { notif } from '#lib/notifications.svelte.ts';
   import Sheet from './Sheet.svelte';
@@ -16,19 +18,29 @@
   let { embedded = false }: { embedded?: boolean } = $props();
 
   let picking = $state(false);
-  let harnessId = $state(getStorageItem('harness') ?? 'devin');
+  // What the New session button starts: a harness (then a folder is picked) or a saved profile (its own folder).
+  let choice = $state<SessionChoice>(parseSessionChoice(getStorageItem('harness')));
   let usableHarnesses = $derived(app.harnesses.filter((h) => h.enabled && (h.installed || h.id === 'devin')));
   let harnessName = (id?: string) => app.harnesses.find((h) => h.id === id)?.name ?? id ?? '';
+  let chosenProfile = $derived(choice.kind === 'profile' ? (ops.profiles.find((p) => p.id === (choice as { profileId: string }).profileId) ?? null) : null);
+  let harnessId = $derived(choice.kind === 'harness' ? choice.harnessId : (chosenProfile?.harnessId ?? 'devin'));
   $effect(() => {
-    if (usableHarnesses.length && !usableHarnesses.some((h) => h.id === harnessId)) harnessId = usableHarnesses[0].id;
+    if (choice.kind === 'harness' && usableHarnesses.length && !usableHarnesses.some((h) => h.id === harnessId)) choice = { kind: 'harness', harnessId: usableHarnesses[0].id };
+    // A deleted profile falls back to a harness once the gateway has listed profiles.
+    if (choice.kind === 'profile' && ops.loaded && !chosenProfile) choice = { kind: 'harness', harnessId: usableHarnesses[0]?.id ?? 'devin' };
   });
+  let showPicker = $derived(usableHarnesses.length > 1 || ops.profiles.length > 0);
+  // Scheduled tasks that wait for a decision, shown on the Tasks link.
+  let tasksNeedingYou = $derived(
+    ops.tasks.map(normalizeTask).filter((t) => t.condition === 'awaiting_confirmation' || t.condition === 'interrupted' || t.condition === 'dependency_failed').length
+  );
 
   // Harness picker in the dock: a glass pill that opens an upward menu.
   let pickerOpen = $state(false);
   let pickerEl = $state<HTMLElement>();
   let pickerBtn = $state<HTMLButtonElement>();
   let pickerMenu = $state<HTMLElement>();
-  let currentName = $derived(harnessName(harnessId));
+  let currentName = $derived(chosenProfile?.name ?? harnessName(harnessId));
   $effect(() => {
     if (!pickerOpen) return;
     tick().then(() => pickerMenu?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus({ preventScroll: true }));
@@ -40,8 +52,9 @@
     pickerOpen = false;
     if (refocus) pickerBtn?.focus();
   }
-  function pickHarness(id: string) {
-    harnessId = id;
+  function pick(next: SessionChoice) {
+    choice = next;
+    setStorageItem('harness', sessionChoiceKey(next));
     closePicker(true);
   }
   function pickerOutside(e: PointerEvent) {
@@ -73,7 +86,7 @@
   let pressTimer: ReturnType<typeof setTimeout> | undefined;
 
   $effect(() => {
-    if (fresh(requests.newSession) && conn.status === 'online') picking = true;
+    if (fresh(requests.newSession) && conn.status === 'online') untrack(newSession);
   });
   $effect(() => {
     if (fresh(requests.search)) searchInput?.focus();
@@ -119,12 +132,11 @@
   // A search shows every match, so groups are expanded while one is active.
   let isCollapsed = (key: string) => !query.trim() && collapsed.includes(key);
 
-  // cwd null: no project, the gateway makes a fresh scratch folder.
-  async function create(cwd: string | null) {
+  // cwd null: no project for a harness (the gateway makes a fresh scratch folder), the profile's own folder for a profile.
+  async function create(cwd: string | null, using: SessionChoice = choice) {
     creating = true;
     try {
-      setStorageItem('harness', harnessId);
-      const r = await rpc('sessions.create', cwd ? { cwd, harnessId } : { harnessId, noProject: true });
+      const r = await rpc('sessions.create', newSessionParams(cwd, using, ops.profiles));
       await openSession(r.id, r.cwd);
       query = '';
       go('#/s/' + encodeURIComponent(r.id));
@@ -133,6 +145,10 @@
     } finally {
       creating = false;
     }
+  }
+  function newSession() {
+    if (choice.kind === 'profile') create(null);
+    else picking = true;
   }
 
   function showActions(s: SessionRow) {
@@ -316,6 +332,15 @@
         </label>
       {/if}
 
+      {#if ops.loaded}
+        <nav class="opsnav" aria-label="Automation">
+          <a class="chip" class:on={route.name === 'tasks'} href="#/tasks"><Icon name="list" /> Tasks{#if tasksNeedingYou}<span class="nbadge" title="{tasksNeedingYou} waiting for you">{tasksNeedingYou}</span>{/if}</a>
+          <a class="chip" class:on={route.name === 'teams'} href="#/teams"><Icon name="subagents" /> Teams</a>
+          <a class="chip" class:on={route.name === 'profiles'} href="#/profiles"><Icon name="folder" /> Profiles</a>
+          <a class="chip" class:on={route.name === 'usage'} href="#/usage"><Icon name="bolt" /> Usage</a>
+        </nav>
+      {/if}
+
       {#if !app.sessionsLoaded}
         <div class="empty"><span class="spinner" style="margin:auto"></span></div>
       {:else if !waiting.length && !groups.length}
@@ -351,7 +376,7 @@
               {#if selecting}
                 {@render selectAll(g.sessions, name)}
               {:else}
-                <button class="gadd press" onclick={() => create(g.cwd)} disabled={creating || g.cwd === '' || conn.status !== 'online'} aria-label="New session in {name}"><Icon name="plus" size={18} /></button>
+                <button class="gadd press" onclick={() => create(g.cwd, g.cwd === null ? { kind: 'harness', harnessId } : choice)} disabled={creating || g.cwd === '' || conn.status !== 'online'} aria-label="New session in {name}"><Icon name="plus" size={18} /></button>
               {/if}
             </div>
             {#if !shut}
@@ -375,7 +400,7 @@
         {#if bulkBusy}<span class="spinner"></span>{:else}<Icon name="trash" size={18} />{/if} Delete ({selectedIds.length})
       </button>
     {:else}
-    {#if usableHarnesses.length > 1}
+    {#if showPicker}
       <div class="hpick" bind:this={pickerEl} onfocusout={pickerFocusOut}>
         <button
           bind:this={pickerBtn}
@@ -384,26 +409,36 @@
           onclick={() => (pickerOpen = !pickerOpen)}
           aria-haspopup="menu"
           aria-expanded={pickerOpen}
-          aria-label="Harness for new sessions: {currentName}"
-          title="Harness for new sessions: {currentName}"
+          aria-label="New sessions use: {currentName}"
+          title="New sessions use: {currentName}"
         >
-          <span class="hcur">{shortHarnessName(currentName)}</span>
+          <span class="hcur">{chosenProfile ? currentName : shortHarnessName(currentName)}</span>
           <span class="hchev" aria-hidden="true"><Icon name="down" size={16} /></span>
         </button>
         {#if pickerOpen}
-          <div class="hmenu glass-heavy" role="menu" aria-label="Harness for new sessions" tabindex="-1" bind:this={pickerMenu} onkeydown={menuKey}>
+          <div class="hmenu glass-heavy" role="menu" aria-label="New sessions use" tabindex="-1" bind:this={pickerMenu} onkeydown={menuKey}>
             {#each usableHarnesses as h (h.id)}
-              {@const on = h.id === harnessId}
-              <button class="hitem" class:on role="menuitemradio" aria-checked={on} onclick={() => pickHarness(h.id)}>
+              {@const on = choice.kind === 'harness' && h.id === harnessId}
+              <button class="hitem" class:on role="menuitemradio" aria-checked={on} onclick={() => pick({ kind: 'harness', harnessId: h.id })}>
                 <span class="hname">{h.name}</span>
                 {#if on}<span class="hcheck"><Icon name="check" size={18} /></span>{/if}
               </button>
             {/each}
+            {#if ops.profiles.length}
+              <div class="hsep" role="presentation">Profiles</div>
+              {#each ops.profiles as p (p.id)}
+                {@const on = choice.kind === 'profile' && chosenProfile?.id === p.id}
+                <button class="hitem" class:on role="menuitemradio" aria-checked={on} onclick={() => pick({ kind: 'profile', profileId: p.id })}>
+                  <span class="hname">{p.name}<small>{shortHarnessName(harnessName(p.harnessId))} · {projectLabel(p.cwd, conn.info?.scratchDir)}</small></span>
+                  {#if on}<span class="hcheck"><Icon name="check" size={18} /></span>{/if}
+                </button>
+              {/each}
+            {/if}
           </div>
         {/if}
       </div>
     {/if}
-    <button class="btn primary newbtn" onclick={() => (picking = true)} disabled={creating || conn.status !== 'online'} title="New session (⌘N)">
+    <button class="btn primary newbtn" onclick={newSession} disabled={creating || conn.status !== 'online'} title={chosenProfile ? 'New session in ' + chosenProfile.name + ' (⌘N)' : 'New session (⌘N)'}>
       {#if creating}<span class="spinner"></span>{:else}<Icon name="compose" size={18} />{/if} New session
     </button>
     {/if}
@@ -850,6 +885,50 @@
     flex: none;
     display: grid;
     color: var(--accent-text);
+  }
+  .hname small {
+    display: block;
+    font-size: 12px;
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .hsep {
+    margin: 6px 14px 2px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-3);
+  }
+  .opsnav {
+    display: flex;
+    gap: 6px;
+    margin: 10px 0 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .opsnav .chip {
+    flex: none;
+    height: 32px;
+    text-decoration: none;
+    color: var(--text);
+  }
+  .opsnav .chip.on {
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+  .nbadge {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--amber);
+    color: #111;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
   }
   .hbadge {
     display: inline-block;
